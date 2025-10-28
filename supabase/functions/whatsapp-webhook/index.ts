@@ -1,7 +1,7 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.0';
 // Importamos el agente simulado (LangGraph Mock) de la Capa 4/5
-import { agentManager } from '../agent-manager/agentManager.ts'; 
+import { runLangGraphAgent } from './agent_manager.ts';
 
 // ----------------------------------------------------------------
 // Configuraciones de Entorno (Capa 2: Autenticación & Meta)
@@ -96,14 +96,7 @@ serve(async (req) => {
       
       // Lógica CRÍTICA para evitar timeout de WhatsApp:
       // Devolvemos 200 OK inmediatamente.
-      req.waitUntil(agentManager({
-          userId: userId,
-          whatsappId: whatsappUserId,
-          message: messageContent,
-          secureClient: secureClient,
-          // Las claves de Meta se pasan aquí o se leen directamente en agentManager.ts
-          // Para esta versión, asumimos que agentManager.ts las lee.
-      }));
+      req.waitUntil(runLangGraphAgent(secureClient, text_content, whatsappUserId));
 
       // Retorno síncrono de baja latencia
       return new Response('OK - Processing asynchronously', { status: 200 });
