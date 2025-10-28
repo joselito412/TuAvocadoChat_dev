@@ -1,0 +1,65 @@
+# -------------------------------------------------------------------
+# 🛑 SECRETS Y VARIABLES DE ENTORNO (CRÍTICO)
+# -------------------------------------------------------------------
+# ¡ABSOLUTAMENTE PROHIBIDO SUBIR ESTO! Contiene claves API y tokens.
+.env
+.env.local
+*.auth
+*.keys
+
+# -------------------------------------------------------------------
+# 🥑 SUPABASE CLI Y ESTRUCTURA DE BASE DE DATOS
+# -------------------------------------------------------------------
+# Archivos generados por 'supabase init' o 'supabase start'
+.supabase/
+# Archivos de configuración que cambian en local
+supabase/config.toml
+# Migraciones y esquema de la DB (se manejan por separado en el flujo de trabajo)
+supabase/migrations/
+supabase/db/
+
+# -------------------------------------------------------------------
+# ⚙️ DENO Y TYPESCRIPT (Edge Functions - Capas 1, 2)
+# -------------------------------------------------------------------
+# Archivos de caché de compilación de TypeScript/Deno
+.tsbuildinfo
+.deno_plugins/
+# Caché de Deno y módulos globales
+.deno_plugins/
+.cache/
+# Archivos temporales de Deno
+.deno_dir/
+
+# -------------------------------------------------------------------
+# 📦 NODE.JS Y DEPENDENCIAS (Práctica defensiva/tools auxiliares)
+# -------------------------------------------------------------------
+node_modules/
+# Bloqueos de dependencia
+package-lock.json
+npm-debug.log*
+yarn-error.log
+
+# -------------------------------------------------------------------
+# 🖥️ ENTORNO DE DESARROLLO (VSCODE)
+# -------------------------------------------------------------------
+# Carpeta de configuración de la IDE.
+.vscode/*
+# Excluir la carpeta settings si no es compartida
+!.vscode/settings.json
+# Archivos de workspace
+*.code-workspace
+
+# -------------------------------------------------------------------
+# 🍎 SISTEMAS OPERATIVOS Y VARIOS
+# -------------------------------------------------------------------
+# macOS
+.DS_Store
+.localized
+# Windows
+Thumbs.db
+Desktop.ini
+# Linux
+*~
+# Logs y Archivos Temporales
+*.log
+tmp/
