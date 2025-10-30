@@ -1,0 +1,30 @@
+{
+  "name": "avocado-ingesta-local",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Script local para ingesta de documentos RAG (Capa 0).",
+  "main": "ingest.ts",
+  "scripts": {
+    "ingest": "ts-node --esm ingest.ts"
+  },
+  "keywords": [
+    "supabase",
+    "gemini",
+    "rag"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^0.14.0",
+    "@supabase/supabase-js": "^2.44.2",
+    "dotenv": "^16.4.5",
+    "fs": "^0.0.1-security",
+    "google-auth-library": "^10.5.0",
+    "path": "^0.12.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.3"
+  }
+}
