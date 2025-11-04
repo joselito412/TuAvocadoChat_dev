@@ -5,7 +5,7 @@
   "description": "Script local para ingesta de documentos RAG (Capa 0).",
   "main": "ingest.ts",
   "scripts": {
-    "ingest": "ts-node --esm ingest.ts"
+    "start": "ts-node --esm ingest.ts" 
   },
   "keywords": [
     "supabase",
