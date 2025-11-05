@@ -8,16 +8,18 @@ import { GoogleGenAI } from 'https://esm.sh/@google/genai@0.14.0'; // SDK de Gem
 // ----------------------------------------------------------------------
 const WHATSAPP_API_TOKEN = Deno.env.get('WHATSAPP_API_TOKEN')!;
 const WHATSAPP_PHONE_ID = Deno.env.get('WHATSAPP_PHONE_ID')!;
-// [NUEVO] CRÍTICO para el Handoff a Agente Humano (Capa 5)
+
+// CRÍTICO para el Handoff a Agente Humano (Capa 5)
 const N8N_HANDOFF_WEBHOOK_URL = Deno.env.get('N8N_HANDOFF_WEBHOOK_URL')!; 
 
 // 🔑 CLAVES DE LLM (Obtenidas de Secrets)
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY')!; // Clave principal
-const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY'); // Clave de respaldo (comentada)
+// const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY'); // Clave de respaldo
 
 // Modelos usados para el Agente AVOCADO
 const GEMINI_EMBEDDING_MODEL = 'text-embedding-004'; 
-const GEMINI_GENERATION_MODEL = 'gemini-2.5-flash';  
+const GEMINI_GENERATION_MODEL = 'gemini-2.5-flash'; 
+ 
 // Modelo para el clasificador (Router)
 const GEMINI_CLASSIFICATION_MODEL = 'gemini-2.5-flash'; 
 

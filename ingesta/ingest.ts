@@ -1,19 +1,18 @@
 // ingest/ingest.ts
 
-import { createClient } from '@supabase/supabase-js';
-import { GoogleGenAI } from '@google/genai';
-// [CRÍTICO] Importación para autenticación OAuth2 (ADC)
-import { GoogleAuth } from 'google-auth-library'; 
+// --- Usamos importaciones de paquetes Node.js locales ---
+import { createClient } from '@supabase/supabase-js'; 
+import { GoogleGenAI } from '@google/genai';         
+import { GoogleAuth } from 'google-auth-library'; // <-- Revertimos a usar GoogleAuth
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config'; 
-// [CRÍTICO] Para resolver ReferenceError: __dirname
 import { fileURLToPath } from 'url';
 
 // --- CONFIGURACIÓN DE ENTORNO (CRÍTICA) ---
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!; 
-
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!; 
+// Eliminamos GEMINI_API_KEY ya que no es compatible
 const EMBEDDING_MODEL = 'text-embedding-004'; 
 
 // CRÍTICO: IDs para la prueba (deben existir en sus respectivas tablas)
@@ -21,10 +20,10 @@ const TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001";
 const TEST_DOCUMENT_ID = "11111111-1111-1111-1111-111111111111"; 
 
 // Cliente Supabase (Con rol de servicio para bypass RLS)
-if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("ERROR: Las variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY no están configuradas.");
 }
-const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 
 // [FUNCIÓN DE AUTENTICACIÓN] Obtiene el cliente OAuth2 usando ADC
@@ -33,7 +32,8 @@ async function getGoogleAuthClient() {
     const SERVICE_ACCOUNT_TO_IMPERSONATE = '688865581027-compute@developer.gserviceaccount.com';
 
     const auth = new GoogleAuth({
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'], 
+        // Usamos el scope válido que autorizamos con gcloud
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
     });
     
     // [CRÍTICO]: Suplantamos la identidad de la Service Account que tiene el permiso
