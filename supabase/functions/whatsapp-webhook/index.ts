@@ -1,7 +1,9 @@
+// supabase/functions/whatsapp-webhook/index.ts
+
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.0';
 // Importamos el agente simulado (LangGraph Mock) de la Capa 4/5
-import { runLangGraphAgent } from './agent_manager.ts';
+import { runAgentRouter } from './agent_manager.ts';
 
 // ----------------------------------------------------------------
 // Configuraciones de Entorno (Capa 2: Autenticación & Meta)
@@ -15,9 +17,14 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('PROJECT_SERVICE_KEY')!;
 const WHATSAPP_VERIFY_TOKEN = Deno.env.get('WHATSAPP_VERIFY_TOKEN')!;
 const N8N_EMAIL_VERIFY_WEBHOOK = Deno.env.get('N8N_EMAIL_VERIFY_WEBHOOK')!; 
 
+// 🆕 Variable de Control de Logs (Cambio 5)
+const IS_LOCAL_DEV = Deno.env.get('IS_LOCAL_DEV'); 
+
 // ----------------------------------------------------------------
 // Funciones de Seguridad y Orquestación (Capa 2)
 // ----------------------------------------------------------------
+// ... (funciones sendVerificationEmail, generateRandomCode, authenticateAndGetUserProfile)
+// ... (Mantenidas sin cambios por brevedad, asume que están presentes)
 
 /**
  * [Capa 5: Delegación Asíncrona] Dispara el Webhook de n8n para enviar el código de verificación por email.
@@ -104,17 +111,19 @@ serve(async (req) => {
 
       // 3. AUTENTICACIÓN Y SEGURIDAD (Capa 2)
       
-      // 🚨 CAMBIO CRÍTICO: Usar Service Role Client para la RPC de autenticación
-      // Esto bypassa el RLS de INSERT que está causando el conflicto
       const serviceRoleClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
       
       // Llamada a la RPC con el cliente con privilegios
       const userProfile = await authenticateAndGetUserProfile(whatsappUserId, serviceRoleClient);
       const jwtToken = userProfile.jwt_token; // CRÍTICO: Extracción directa del JWT
       
-      // 🚨 LOG CRÍTICO: Capturar el JWT para la prueba RLS
-      console.log('✅ JWT Generado (Copia para RLS TEST):', jwtToken); 
-      console.log('UUID del Usuario (RLS):', userProfile.id);
+      // 🚨 LOGS CONDICIONALES (Cambio 5: Solo en desarrollo para RLS)
+      if (IS_LOCAL_DEV === 'true') {
+          console.log('--- DEBUG LOGS (DESARROLLO) ---');
+          console.log('✅ JWT Generado (Copia para RLS TEST):', jwtToken); 
+          console.log('UUID del Usuario (RLS):', userProfile.id);
+          console.log('------------------------------');
+      }
 
       // Lógica simple para inferir si el email debe verificarse (Ejemplo)
       if (userProfile.email && !userProfile.email_verified) { 
@@ -123,7 +132,6 @@ serve(async (req) => {
       }
       
       // 4. Crear un cliente seguro con el JWT adjunto para aplicar RLS (Capa 3)
-      // ESTE CLIENTE SÍ RESPETA EL RLS Y SE USA EN EL RESTO DEL FLUJO
       const secureClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         global: {
           headers: {
@@ -134,7 +142,7 @@ serve(async (req) => {
       console.log('✅ Cliente Seguro (RLS) inicializado.');
 
       // 5. DELEGACIÓN ASÍNCRONA A LANGRGRAPH (Capa 4)
-      req.waitUntil(runLangGraphAgent(secureClient, messageContent, whatsappUserId));
+      req.waitUntil(runAgentRouter(secureClient, messageContent, whatsappUserId));
 
       // 6. Retorno síncrono de baja latencia (Capa 1 CRÍTICA)
       console.log('--- RETORNO SÍNCRONO 200 OK (Capa 1) ---');
@@ -142,6 +150,7 @@ serve(async (req) => {
 
     } catch (e) {
       console.error('Error in POST handler:', e.message);
+      // Fallback para errores no controlados, aunque LangGraph maneja la mayoría.
       return new Response(`Internal Server Error: ${e.message}`, { status: 500 });
     }
   }

@@ -10,22 +10,85 @@ const WHATSAPP_API_TOKEN = Deno.env.get('WHATSAPP_API_TOKEN')!;
 const WHATSAPP_PHONE_ID = Deno.env.get('WHATSAPP_PHONE_ID')!;
 
 // CRÍTICO para el Handoff a Agente Humano (Capa 5)
-const N8N_HANDOFF_WEBHOOK_URL = Deno.env.get('N8N_HANDOFF_WEBHOOK_URL')!; 
+const N8N_HANDOFF_WEBHOOK_URL = Deno.env.get('N8N_HANDOFF_WEBHOOK_URL')!; // Corregido el nombre de la constante
 
 // 🔑 CLAVES DE LLM (Obtenidas de Secrets)
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY')!; // Clave principal
-// const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY'); // Clave de respaldo
 
 // Modelos usados para el Agente AVOCADO
 const GEMINI_EMBEDDING_MODEL = 'text-embedding-004'; 
 const GEMINI_GENERATION_MODEL = 'gemini-2.5-flash'; 
- 
-// Modelo para el clasificador (Router)
 const GEMINI_CLASSIFICATION_MODEL = 'gemini-2.5-flash'; 
 
+// CRÍTICO: Mapeo de Thresholds para RAG Híbrido (Cambio 6)
+const THRESHOLD_MAP: Record<string, number> = {
+    'Derecho Penal': 0.80,   
+    'Derecho Civil': 0.70,   
+    'Derecho Laboral': 0.75, 
+};
+const DEFAULT_THRESHOLD = 0.65; 
+
+// 🚨 VALIDACIÓN CRÍTICA (Cambio 1)
+if (!GEMINI_API_KEY) {
+    throw new Error('ERROR CRÍTICO: GEMINI_API_KEY no está configurada en los Secrets de Supabase.');
+}
+
 // Inicialización del cliente Gemini
-// Solo se inicializa si la clave existe; de lo contrario, fallará la ejecución LLM.
 const geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY }); 
+
+// ----------------------------------------------------------------------
+// --- CIRCUIT BREAKER (Cambio 9: Resiliencia) ---
+// ----------------------------------------------------------------------
+
+class CircuitBreaker {
+    private failures = 0; private lastFailTime = 0; private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    private failureThreshold = 5; private timeout = 60000; // 1 minuto
+
+    async execute<T>(fn: () => Promise<T>, fallback: T, service: string): Promise<T> {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailTime > this.timeout) { this.state = 'HALF_OPEN'; } 
+            else { console.warn(`[BREAKER] ${service} OPEN. Forzando Fallback.`); return fallback; }
+        }
+        
+        try {
+            const result = await fn(); this.onSuccess(); return result;
+        } catch (error) {
+            console.error(`[BREAKER] ${service} Fallo:`, error.message); this.onFailure();
+            if (this.state === 'OPEN' || this.state === 'HALF_OPEN') { return fallback; }
+            throw error; 
+        }
+    }
+    private onSuccess() {
+        if (this.state !== 'CLOSED') console.log('[BREAKER] CERRADO: Servicio recuperado.');
+        this.failures = 0; this.state = 'CLOSED';
+    }
+    private onFailure() {
+        this.failures++; this.lastFailTime = Date.now();
+        if (this.state !== 'OPEN' && this.failures >= this.failureThreshold) {
+            this.state = 'OPEN'; console.error('[BREAKER] ABIERTO: Excedido umbral de fallos. Servicio degradado.');
+        }
+    }
+}
+const geminiBreaker = new CircuitBreaker();
+
+// --- FALLBACK DEFINITIONS ---
+const FALLBACK_EMBEDDING = Array(768).fill(0); 
+const FALLBACK_CLASSIFICATION = { specialty: 'Sin Clasificar', usage: 0 };
+const FALLBACK_AUGMENTATION_TEXT = "🤖 [Sistema Degradado] Lo siento, el servicio de IA está experimentando fallas críticas. Hemos iniciado el **Handoff de emergencia** a un abogado humano.";
+const FALLBACK_AUGMENTATION = { responseText: FALLBACK_AUGMENTATION_TEXT, usage: 0 };
+
+// ----------------------------------------------------------------------
+// --- FUNCIONES DE CÁCHÉ Y HASHING (Cambio 11) ---
+// ----------------------------------------------------------------------
+
+/** Helper: Genera un hash MD5 de la consulta para usar como clave de caché. */
+async function createMD5Hash(text: string): Promise<string> {
+    const data = new TextEncoder().encode(text.toLowerCase().trim());
+    const hashBuffer = await crypto.subtle.digest("MD5", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 
 // ----------------------------------------------------------------------
 // --- SERVICIOS DE COMUNICACIÓN (Capa 4/5) ---
@@ -40,249 +103,257 @@ async function sendWhatsappMessage(phoneNumber: string, message: string): Promis
         text: { body: message }
     };
     
-    // Llamada al endpoint de Meta
     const response = await fetch(`https://graph.whatsapp.com/v19.0/${WHATSAPP_PHONE_ID}/messages`, {
         method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${WHATSAPP_API_TOKEN}`, 
-            'Content-Type': 'application/json',
-        },
+        headers: { 'Authorization': `Bearer ${WHATSAPP_API_TOKEN}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(`Fallo al enviar mensaje a WhatsApp: ${JSON.stringify(errorData)}`);
+        console.error(`Fallo al enviar mensaje a WhatsApp: ${JSON.stringify(errorData)}`);
     }
 }
+
+// ----------------------------------------------------------------------
+// --- FUNCIÓN DE RATE LIMITING (Cambio 12) ---
+// ----------------------------------------------------------------------
+const RATE_LIMIT_COUNT = 10; 
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; 
+
+async function checkRateLimit(secureClient: SupabaseClient, userId: string): Promise<boolean> {
+    const { data, error } = await secureClient
+        .from('user_rate_limits')
+        .select('*')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') { console.error('Error al consultar tabla de Rate Limit:', error); return true; }
+    const now = Date.now();
+
+    if (!data) {
+        await secureClient.from('user_rate_limits').insert({ user_id: userId, request_count: 1 });
+        return true;
+    }
+    const windowStart = new Date(data.window_start).getTime();
+
+    if (now - windowStart > RATE_LIMIT_WINDOW_MS) {
+        await secureClient.from('user_rate_limits').update({ request_count: 1, window_start: new Date().toISOString() }).eq('user_id', userId);
+        return true;
+    }
+
+    if (data.request_count >= RATE_LIMIT_COUNT) { return false; }
+
+    secureClient.from('user_rate_limits').update({ request_count: data.request_count + 1 }).eq('user_id', userId)
+        .then(() => {}).catch(err => console.error('Error al actualizar Rate Limit:', err));
+
+    return true;
+}
+
 
 // ----------------------------------------------------------------------
 // --- SERVICIOS LLM Y RAG (Capa 4: Implementación Real) ---
 // ----------------------------------------------------------------------
 
-/** Genera el embedding de la consulta usando Gemini (Principal). */
-async function generateQueryEmbedding(query: string): Promise<number[]> {
-    try {
-        if (!GEMINI_API_KEY) {
-            throw new Error('GEMINI_API_KEY no configurada en Secrets.');
-        } 
-
-        // Llamada real al modelo de embedding de Gemini
-        const response = await geminiClient.models.embedContent({
-            model: GEMINI_EMBEDDING_MODEL,
-            content: query,
-            taskType: "RETRIEVAL_QUERY",
-        });
-        return response.embedding;
-    } catch (e) {
-        console.error('Fallo en la generación de embedding con Gemini (Principal):', e.message);
-        
-        // Fallback si la clave o la API fallan. (Vector Mock)
-        console.warn('Usando vector Mock. El RAG fallará hasta que se ingeste conocimiento real.');
-        return Array(1536).fill(Math.random()); 
+/** Genera el embedding de la consulta, utilizando cache si es posible (Cambio 11). */
+async function generateQueryEmbedding(secureClient: SupabaseClient, query: string): Promise<number[]> {
+    const queryHash = await createMD5Hash(query);
+    // 1. Intentar leer del cache (Cache Hit)
+    const { data: cached } = await secureClient.from('embedding_cache').select('embedding').eq('query_hash', queryHash).maybeSingle(); 
+    if (cached) { 
+        console.log('[CACHE HIT] Embedding recuperado.');
+        secureClient.from('embedding_cache').update({ hit_count: (cached.hit_count || 0) + 1 }).eq('query_hash', queryHash).then(() => {}).catch(console.error);
+        return cached.embedding;
     }
+    
+    // 2. Cache Miss: Generar nuevo embedding (Cambio 9)
+    const uncachedFn = async () => { return (await geminiClient.models.embedContent({ model: GEMINI_EMBEDDING_MODEL, content: query, taskType: "RETRIEVAL_QUERY" })).embedding; };
+    let embedding: number[];
+    try { embedding = await geminiBreaker.execute(uncachedFn, FALLBACK_EMBEDDING, 'Embedding Service'); } catch (e) { throw e; }
+
+    // 3. Guardar en cache (Cambio 11)
+    if (embedding !== FALLBACK_EMBEDDING) {
+        secureClient.from('embedding_cache').insert({ query_hash: queryHash, embedding: embedding }).then(() => console.log('[CACHE MISS] Guardado.')).catch(console.warn);
+    }
+    return embedding;
 }
 
 /** Llama a la RPC de PostgreSQL para buscar fragmentos legales (Retrieval) */
 async function retrieveRAGContext(secureClient: SupabaseClient, query: string, specialty?: string): Promise<any[]> {
-    // 1. Generar el embedding de la consulta del usuario
-    const queryEmbedding = await generateQueryEmbedding(query);
+    const queryEmbedding = await generateQueryEmbedding(secureClient, query);
+    const determinedSpecialty = specialty && specialty !== 'Sin Clasificar' ? specialty : 'Sin Clasificar';
+    const matchThreshold = THRESHOLD_MAP[determinedSpecialty] || DEFAULT_THRESHOLD;
 
-    // 2. Llamada a la RPC de PostgreSQL (pgvector)
+    console.log(`[RAG] Usando Threshold: ${matchThreshold}`);
+
     const { data, error } = await secureClient.rpc('match_legal_documents', {
-        query_embedding: queryEmbedding as any, 
-        p_specialty: specialty || null, // CRÍTICO: Filtro de metadatos (RAG Híbrido)
-        p_match_threshold: 0.75, // Ajustado a los nombres del RPC
-        p_match_count: 3 // Ajustado a los nombres del RPC
+        query_embedding: queryEmbedding as any, p_specialty: specialty || null, p_match_threshold: matchThreshold, p_match_count: 3 
     });
 
-    if (error) {
-        console.error('Error en RPC RAG:', error.message);
-        return [];
-    }
+    if (error) { console.error('Error en RPC RAG:', error.message); return []; }
+    if (queryEmbedding === FALLBACK_EMBEDDING) { console.warn('Alerta: Embedding Fallback usado. Ignorando resultados RAG.'); return []; }
     return data;
 }
 
-/** Clasifica la consulta del usuario para determinar la especialidad legal (Router de LangGraph). */
-async function classifyLegalSpecialty(query: string): Promise<string> {
-    const systemPrompt = `Eres un clasificador de consultas legales. Tu única función es identificar la especialidad legal de la siguiente consulta.
-    Debes responder ÚNICAMENTE con una de estas etiquetas: 'Derecho Penal', 'Derecho Civil', 'Derecho Laboral', o 'Sin Clasificar'.
-    NO incluyas ninguna explicación, texto adicional, formato JSON, ni signos de puntuación.`;
-    
-    try {
-        const response = await geminiClient.models.generateContent({
-            model: GEMINI_CLASSIFICATION_MODEL,
-            contents: [{ role: 'user', parts: [{ text: `Consulta: ${query}` }] }],
-            config: {
-                systemInstruction: systemPrompt,
-                temperature: 0.1 // Baja temperatura para una clasificación determinista
-            }
-        });
-
-        // Limpieza de la respuesta para obtener solo la etiqueta
-        const result = response.text.trim();
-        
-        // Validación de las etiquetas permitidas
-        if (['Derecho Penal', 'Derecho Civil', 'Derecho Laboral'].includes(result)) {
-            return result;
-        }
-
-        // Devolvemos 'Sin Clasificar' si el LLM falla en seguir el prompt
-        return 'Sin Clasificar';
-    } catch (e) {
-        console.error('Fallo en la clasificación de especialidad con Gemini:', e.message);
-        return 'Sin Clasificar'; // Fallback seguro
-    }
-}
-
-/** Genera la respuesta final usando el LLM (Augmentation) */
-async function generateAugmentedResponse(context: string, query: string): Promise<string> {
-    const systemPrompt = `Eres el Agente Legal AVOCADO. Genera un "Concepto Previo" basándote únicamente en el contexto legal proporcionado. Si el contexto es insuficiente, informa al usuario que se necesita asistencia humana (Handoff). Sé conciso y profesional.`;
-    
-    const userPrompt = `Consulta del usuario: ${query}\n\nContexto Legal Recuperado:\n---\n${context}\n---`;
-
-    try {
-        const response = await geminiClient.models.generateContent({
-            model: GEMINI_GENERATION_MODEL,
-            contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-            config: {
-                systemInstruction: systemPrompt,
-            }
-        });
-        
-        return response.text.trim();
-    } catch (e) {
-        console.error('Fallo en la generación de respuesta con Gemini (Generación):', e.message);
-        // Fallback si la generación LLM falla
-        return "🤖 LangGraph: Lo siento, la inteligencia artificial está experimentando dificultades. Sugiero solicitar un Handoff.";
-    }
-}
-
-// ----------------------------------------------------------------------
-// --- FUNCIONES DE HANDOFF Y CHECKPOINTING (Capa 4 -> C3/C5) ---
-// ----------------------------------------------------------------------
-
-// Tarea II.3: Checkpointing
-/** Guarda el estado actual de la conversación o el mensaje en la tabla chat_history. */
-async function saveCheckpoint(secureClient: SupabaseClient, user_id: string, message_text: string, is_handoff: boolean): Promise<void> {
-    const { error } = await secureClient
-        .from('chat_history')
-        .insert({
-            user_id: user_id, 
-            message_text: message_text,
-            is_ai: false, // El mensaje siempre viene del usuario
-            is_handoff_initiated: is_handoff, // Indica si este mensaje activó el Handoff
-        });
-    
-    if (error) {
-        console.error('Error al guardar checkpoint (chat_history):', error);
-    }
-}
-
-// Tarea II.2: Finalizar Handoff Condicional
-/** Delega asíncronamente la creación del caso en el sistema de agente humano (n8n/Capa 5). */
-async function executeHandoff(user_id: string, whatsapp_id: string, message_text: string, specialty: string): Promise<void> {
-    if (!N8N_HANDOFF_WEBHOOK_URL) {
-        console.error("N8N_HANDOFF_WEBHOOK_URL no está configurado. Handoff fallido.");
-        return;
-    }
-    
-    const handoffPayload = {
-        user_id: user_id,
-        whatsapp_id: whatsapp_id, // Necesario para contactar al usuario
-        initial_query: message_text,
-        agent_reason: `RAG fallido o clasificación: ${specialty}`,
-        conversation_summary: `Consulta inicial: ${message_text}`, 
+/** Clasifica la consulta y devuelve los tokens usados (Cambio 4, 7, 9) */
+async function classifyLegalSpecialty(query: string): Promise<{ specialty: string, usage: number }> {
+    const systemPrompt = `Eres un clasificador de consultas legales. Tu única función es identificar la especialidad legal de la siguiente consulta. Debes responder ÚNICAMENTE con una de estas etiquetas: 'Derecho Penal', 'Derecho Civil', 'Derecho Laboral', o 'Sin Clasificar'. NO incluyas ninguna explicación, texto adicional, formato JSON, ni signos de puntuación.`; 
+    const fn = async () => {
+        const response = await geminiClient.models.generateContent({ model: GEMINI_CLASSIFICATION_MODEL, contents: [{ role: 'user', parts: [{ text: `Consulta: ${query}` }] }], config: { systemInstruction: systemPrompt, temperature: 0.1 } });
+        const usage = response.usageMetadata?.totalTokens || 0; 
+        const specialtyMap: Record<string, string> = { 'derecho penal': 'Derecho Penal', 'derecho civil': 'Derecho Civil', 'derecho laboral': 'Derecho Laboral', 'sin clasificar': 'Sin Clasificar', };
+        const normalized = response.text.trim().toLowerCase().replace(/[.,]/g, '');
+        if (specialtyMap[normalized]) { return { specialty: specialtyMap[normalized], usage }; }
+        return { specialty: 'Sin Clasificar', usage };
     };
 
-    // fetch sin 'await' (delegación asíncrona CRÍTICA)
-    fetch(N8N_HANDOFF_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(handoffPayload),
-    }).catch(err => {
-        console.error("Error al disparar Webhook de n8n para Handoff:", err);
-    });
+    try { return await geminiBreaker.execute(fn, FALLBACK_CLASSIFICATION, 'Classification Service'); } catch (e) { throw e; }
+}
+
+/** Genera la respuesta, la transmite por streaming y devuelve los tokens usados (Cambio 7, 9, 10) */
+async function generateAugmentedResponse(context: string, query: string, whatsappId: string): Promise<{ responseText: string, usage: number }> {
+    const systemPrompt = `Eres el Agente Legal AVOCADO. Genera un "Concepto Previo" basándote únicamente en el contexto legal proporcionado. Si el contexto es insuficiente, informa al usuario que se necesita asistencia humana (Handoff). Sé conciso y profesional.`;
+    const userPrompt = `Consulta del usuario: ${query}\n\nContexto Legal Recuperado:\n---\n${context}\n---`;
+
+    const fn = async () => {
+        const stream = await geminiClient.models.generateContentStream({ model: GEMINI_GENERATION_MODEL, contents: [{ role: 'user', parts: [{ text: userPrompt }] }], config: { systemInstruction: systemPrompt } });
+        let fullText = ''; let buffer = ''; const CHUNK_SIZE = 150; 
+        
+        for await (const chunk of stream) {
+            const text = chunk.text || ''; buffer += text; fullText += text;
+            if (buffer.length >= CHUNK_SIZE) { await sendWhatsappMessage(whatsappId, buffer); buffer = ''; }
+        }
+        if (buffer.length > 0) { await sendWhatsappMessage(whatsappId, buffer); }
+        
+        const usage = stream.usageMetadata?.totalTokens || 0;
+        return { responseText: fullText, usage };
+    };
+
+    try {
+        const result = await geminiBreaker.execute(fn, FALLBACK_AUGMENTATION, 'Augmentation Service');
+        if (result.responseText === FALLBACK_AUGMENTATION_TEXT) { await sendWhatsappMessage(whatsappId, result.responseText); }
+        return result;
+
+    } catch (e) {
+        console.error('Fallo grave no controlado en generación:', e.message);
+        await sendWhatsappMessage(whatsappId, FALLBACK_AUGMENTATION_TEXT);
+        return FALLBACK_AUGMENTATION;
+    }
 }
 
 
 // ----------------------------------------------------------------------
-// --- LÓGICA CENTRAL DEL AGENTE LANGGRAPH (Capa 4) ---
+// --- FUNCIONES DE VALIDACIÓN Y HANDOFF ---
+// ----------------------------------------------------------------------
+const MAX_INPUT_LENGTH = 2000;
+const MIN_INPUT_LENGTH = 5;
+
+/** Valida la longitud y realiza sanitización básica del mensaje del usuario (Cambio 8). */
+function validateInput(message: string): string {
+    const trimmedMessage = message.trim();
+    if (trimmedMessage.length < MIN_INPUT_LENGTH) { throw new Error("Validation Error: Message too short."); }
+    if (trimmedMessage.length > MAX_INPUT_LENGTH) { throw new Error(`Validation Error: Message exceeds ${MAX_INPUT_LENGTH} characters.`); }
+    const sanitizedMessage = trimmedMessage.replace(/[\x00-\x1F\x7F]/g, ''); 
+    return sanitizedMessage;
+}
+
+/** Guarda el estado actual de la conversación o el mensaje en la tabla chat_history. */
+async function saveCheckpoint(secureClient: SupabaseClient, user_id: string, message_text: string, is_handoff: boolean): Promise<void> {
+    const { error } = await secureClient.from('chat_history').insert({ user_id: user_id, message_text: message_text, is_ai: false, is_handoff_initiated: is_handoff, });
+    if (error) { console.error('Error al guardar checkpoint (chat_history):', error); }
+}
+
+/** Delega asíncronamente la creación del caso en el sistema de agente humano (n8n/Capa 5). */
+async function executeHandoff(user_id: string, whatsapp_id: string, message_text: string, specialty: string): Promise<void> {
+    if (!N8N_HANDOFF_WEBHOOK_URL) { console.error("N8N_HANDOFF_WEBHOOK_URL no está configurado. Handoff fallido."); return; }
+    
+    const handoffPayload = { user_id: user_id, whatsapp_id: whatsapp_id, initial_query: message_text, agent_reason: `RAG fallido o clasificación: ${specialty}`, conversation_summary: `Consulta inicial: ${message_text}`, };
+
+    fetch(N8N_HANDOFF_WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(handoffPayload), }).catch(err => { console.error("Error al disparar Webhook de n8n para Handoff:", err); });
+}
+
+
+// ----------------------------------------------------------------------
+// --- LÓGICA CENTRAL DEL AGENTE ROUTER (Capa 4) ---
 // ----------------------------------------------------------------------
 
-/** Función central que ejecuta el ciclo de LangGraph (LangGraph Mock en Deno). */
-export async function runLangGraphAgent(
+export async function runAgentRouter( // <-- Nombre de la función final (Cambio 13)
     secureClient: SupabaseClient, 
     message_text: string, 
     whatsapp_id: string
 ): Promise<void> {
     
-    // Obtener el ID del usuario actual (necesario para Checkpointing y Handoff)
     const user = await secureClient.auth.getUser();
     const user_id = user.data.user?.id;
-    if (!user_id) {
-        console.error("Error crítico: User ID no encontrado en la sesión segura.");
-        return;
-    }
-    
-    // 1. Fase de Clasificación (Router de LangGraph)
-    const determined_specialty = await classifyLegalSpecialty(message_text);
+    if (!user_id) return;
 
-    // Bandera para indicar si se debe ejecutar el Handoff
+    // 0. RATE LIMITING (Cambio 12)
+    const isAllowed = await checkRateLimit(secureClient, user_id);
+    if (!isAllowed) {
+        await sendWhatsappMessage(whatsapp_id, `⚠️ Has excedido el límite de ${RATE_LIMIT_COUNT} consultas por minuto. Espera un momento y vuelve a intentarlo.`);
+        return; 
+    }
+
+    // 1. VALIDACIÓN DE ENTRADA (Cambio 8)
+    let sanitized_message: string;
+    try {
+        sanitized_message = validateInput(message_text);
+    } catch (e) {
+        const errorMessage = e.message.includes('too long')
+            ? `⚠️ Lo siento, tu mensaje excede el límite de ${MAX_INPUT_LENGTH} caracteres. Por favor, envíalo en partes más cortas.`
+            : '⚠️ Lo siento, tu mensaje es demasiado corto o contiene caracteres inválidos. Por favor, reformula tu consulta.';
+        await sendWhatsappMessage(whatsapp_id, errorMessage);
+        return; 
+    }
+
+    let totalTokensUsed = 0;
+    
+    // 2. Fase de Clasificación (Router)
+    const { specialty: determined_specialty, usage: classification_tokens } = await classifyLegalSpecialty(sanitized_message);
+    totalTokensUsed += classification_tokens; 
+    
     let executeHandoffFlag = false;
     
-    // 2. Fase de RAG Híbrido (Retrieval)
-    const ragResults = await retrieveRAGContext(secureClient, message_text, determined_specialty);
+    // 3. Fase de RAG Híbrido (Retrieval)
+    const ragResults = await retrieveRAGContext(secureClient, sanitized_message, determined_specialty); 
     let aiResponseText = '';
     
-    // Lógica Condicional del Agente LangGraph (Router)
     if (ragResults.length > 0) {
         // --- NODO: RAG_Executed ---
-        // Ejecución RAG: Augmentation (Generación Aumentada)
         const context = ragResults.map(r => r.content_chunk).join('\n---\n');
         
-        // Generar la respuesta final usando Gemini
-        aiResponseText = await generateAugmentedResponse(context, message_text);
+        // Generación y Streaming (Cambio 10)
+        const { responseText, usage: generation_tokens } = await generateAugmentedResponse(context, sanitized_message, whatsapp_id);
+        
+        aiResponseText = responseText; 
+        totalTokensUsed += generation_tokens; 
+        
+        // Si el Breaker forzó el fallback (enviado por generateAugmentedResponse), activamos el Handoff
+        if (aiResponseText === FALLBACK_AUGMENTATION_TEXT) { executeHandoffFlag = true; }
         
     } else {
-        // --- NODO: Handoff_Initiation ---
-        // Si no hay resultados RAG, se ejecuta la ruta de Handoff
+        // Handoff_Initiation (Si RAG Falla)
         executeHandoffFlag = true;
+        aiResponseText = `🤖 LangGraph: No encontré información específica en la especialidad "${determined_specialty}". Hemos iniciado el **traspaso a un Abogado Humano** (Handoff).`;
         
-        // 3. (Simulación) Respuesta al usuario notificando el Handoff
-        aiResponseText = `🤖 LangGraph: No encontré información específica en la especialidad "${determined_specialty}". Hemos iniciado el **traspaso a un Abogado Humano** (Handoff). Un agente te contactará por este medio tan pronto como esté disponible.`;
-        
-        // 4. Tarea II.3: Checkpointing
-        // Guardamos el último mensaje y marcamos que el Handoff se inició
-        await saveCheckpoint(secureClient, user_id, message_text, true); 
-        
-        // 5. Tarea II.2: Ejecución Asíncrona del Handoff (Capa 5)
-        // La Edge Function lo gestiona sin bloquear el hilo principal
-        executeHandoff(user_id, whatsapp_id, message_text, determined_specialty);
+        await saveCheckpoint(secureClient, user_id, sanitized_message, true); 
+        executeHandoff(user_id, whatsapp_id, sanitized_message, determined_specialty);
     }
     
-    // 6. Paso de Trazabilidad (Auditoría Legal - Capa 3/4)
-    // Se ejecuta al final, independientemente de la ruta (RAG o Handoff)
-    const langgraph_path = executeHandoffFlag 
-        ? ['Router:' + determined_specialty, 'Handoff_Initiated', 'Checkpointing'] 
-        : ['Router:' + determined_specialty, 'RAG_Executed', 'Augmentation'];
+    // 6. Paso de Trazabilidad (Auditoría Legal)
+    const langgraph_path = executeHandoffFlag ? ['Router:' + determined_specialty, 'Handoff_Initiated'] : ['Router:' + determined_specialty, 'RAG_Executed', 'Augmentation'];
         
     const { error: logError } = await secureClient
         .from('ai_interactions')
         .insert({
             user_id: user_id, 
-            prompt_used: message_text,
+            prompt_used: sanitized_message, 
             response_text: aiResponseText,
-            llm_model_used: ragResults.length > 0 ? 'Gemini (Augmented)' : 'Handoff Triggered',
-            cost_in_tokens: 200, 
+            llm_model_used: ragResults.length > 0 ? 'Gemini (Streamed)' : 'Handoff Triggered', 
+            cost_in_tokens: totalTokensUsed, 
             path_langgraph_recorrido: langgraph_path,
             rag_fragments_ids: ragResults.map(r => r.id),
         });
 
-    if (logError) {
-        console.error('ERROR CRÍTICO: Fallo al registrar ai_interactions:', logError);
-    }
-    
-    // 7. Envío de la Respuesta Final (Capa 4/5)
-    await sendWhatsappMessage(whatsapp_id, aiResponseText);
+    if (logError) { console.error('ERROR CRÍTICO: Fallo al registrar ai_interactions:', logError); }
 }
