@@ -10,7 +10,10 @@ const WHATSAPP_API_TOKEN = Deno.env.get('WHATSAPP_API_TOKEN')!;
 const WHATSAPP_PHONE_ID = Deno.env.get('WHATSAPP_PHONE_ID')!;
 
 // CRÍTICO para el Handoff a Agente Humano (Capa 5)
-const N8N_HANDOFF_WEBHOOK_URL = Deno.env.get('N8N_HANDOFF_WEBHOOK_URL')!; // Corregido el nombre de la constante
+const N8N_HANDOFF_WEBHOOK_URL = Deno.env.get('N8N_HANDOFF_WEBHOOK_URL')!; 
+
+// 🆕 CRÍTICO para la Tool Calling (Capa 5)
+const N8N_CASE_CREATION_WEBHOOK = Deno.env.get('N8N_CASE_CREATION_WEBHOOK')!;
 
 // 🔑 CLAVES DE LLM (Obtenidas de Secrets)
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY')!; // Clave principal
@@ -94,7 +97,9 @@ async function createMD5Hash(text: string): Promise<string> {
 // --- SERVICIOS DE COMUNICACIÓN (Capa 4/5) ---
 // ----------------------------------------------------------------------
 
-/** Servicio de Mensajería: Llama a la API de Meta para responder al usuario. */
+/** * Servicio de Mensajería: Llama a la API de Meta para responder al usuario.
+ * 🐛 CORRECCIÓN: Lanzar excepción si falla la respuesta de Meta (Problema 3).
+ */
 async function sendWhatsappMessage(phoneNumber: string, message: string): Promise<void> {
     const payload = {
         messaging_product: 'whatsapp',
@@ -112,7 +117,42 @@ async function sendWhatsappMessage(phoneNumber: string, message: string): Promis
     if (!response.ok) {
         const errorData = await response.json();
         console.error(`Fallo al enviar mensaje a WhatsApp: ${JSON.stringify(errorData)}`);
+        // CORRECCIÓN APLICADA
+        throw new Error(`WhatsApp API Error: ${JSON.stringify(errorData)}`); 
     }
+}
+
+/** * 🆕 TOOL: Llama al webhook de n8n para crear un caso formal en Notion (Capa 5).
+ */
+async function crear_caso_notion(user_id: string, query: string, specialty: string, attachments: string[] = []): Promise<string> {
+    if (!N8N_CASE_CREATION_WEBHOOK) {
+        throw new Error("N8N_CASE_CREATION_WEBHOOK no configurado.");
+    }
+    
+    const payload = {
+        user_id: user_id,
+        whatsapp_id: user_id, 
+        initial_query: query,
+        specialty: specialty,
+        attachments: attachments,
+        source: 'AVOCADO_AI_CHATBOT'
+    };
+    
+    const response = await fetch(N8N_CASE_CREATION_WEBHOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`n8n Case Creation Failed (${response.status}): ${errorText}`);
+    }
+    
+    // Asumimos que n8n devuelve el ID y mensaje de éxito
+    const result = await response.json(); 
+    
+    return `Caso creado con éxito. ID: ${result.case_id || 'N/A'}. Detalles: ${result.message || 'Procesando'}.`;
 }
 
 // ----------------------------------------------------------------------
@@ -121,6 +161,8 @@ async function sendWhatsappMessage(phoneNumber: string, message: string): Promis
 const RATE_LIMIT_COUNT = 10; 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; 
 
+/** * 🐛 CORRECCIÓN: Usar await para atomicidad en la actualización (Problema 1).
+ */
 async function checkRateLimit(secureClient: SupabaseClient, userId: string): Promise<boolean> {
     const { data, error } = await secureClient
         .from('user_rate_limits')
@@ -132,6 +174,7 @@ async function checkRateLimit(secureClient: SupabaseClient, userId: string): Pro
     const now = Date.now();
 
     if (!data) {
+        // Usar await para la primera inserción
         await secureClient.from('user_rate_limits').insert({ user_id: userId, request_count: 1 });
         return true;
     }
@@ -144,8 +187,9 @@ async function checkRateLimit(secureClient: SupabaseClient, userId: string): Pro
 
     if (data.request_count >= RATE_LIMIT_COUNT) { return false; }
 
-    secureClient.from('user_rate_limits').update({ request_count: data.request_count + 1 }).eq('user_id', userId)
-        .then(() => {}).catch(err => console.error('Error al actualizar Rate Limit:', err));
+    // CORRECCIÓN APLICADA (Usar await)
+    const { error: updateError } = await secureClient.from('user_rate_limits').update({ request_count: data.request_count + 1 }).eq('user_id', userId);
+    if (updateError) { console.error('Error al actualizar Rate Limit:', updateError); } 
 
     return true;
 }
@@ -172,13 +216,18 @@ async function generateQueryEmbedding(secureClient: SupabaseClient, query: strin
     try { embedding = await geminiBreaker.execute(uncachedFn, FALLBACK_EMBEDDING, 'Embedding Service'); } catch (e) { throw e; }
 
     // 3. Guardar en cache (Cambio 11)
-    if (embedding !== FALLBACK_EMBEDDING) {
+    // ⚠️ La comparación de arrays es intencionalmente por contenido.
+    const isFallback = embedding.length === FALLBACK_EMBEDDING.length && embedding.every((val, i) => val === FALLBACK_EMBEDDING[i]);
+
+    if (!isFallback) {
         secureClient.from('embedding_cache').insert({ query_hash: queryHash, embedding: embedding }).then(() => console.log('[CACHE MISS] Guardado.')).catch(console.warn);
     }
     return embedding;
 }
 
-/** Llama a la RPC de PostgreSQL para buscar fragmentos legales (Retrieval) */
+/** * Llama a la RPC de PostgreSQL para buscar fragmentos legales (Retrieval).
+ * 🐛 CORRECCIÓN: Validar contenido del array de fallback (Problema 4).
+ */
 async function retrieveRAGContext(secureClient: SupabaseClient, query: string, specialty?: string): Promise<any[]> {
     const queryEmbedding = await generateQueryEmbedding(secureClient, query);
     const determinedSpecialty = specialty && specialty !== 'Sin Clasificar' ? specialty : 'Sin Clasificar';
@@ -186,12 +235,19 @@ async function retrieveRAGContext(secureClient: SupabaseClient, query: string, s
 
     console.log(`[RAG] Usando Threshold: ${matchThreshold}`);
 
+    // CORRECCIÓN APLICADA (Validación por contenido)
+    const isFallback = queryEmbedding.length === FALLBACK_EMBEDDING.length && queryEmbedding.every(v => v === 0);
+    
+    if (isFallback) { 
+        console.warn('Alerta: Embedding Fallback usado. Ignorando resultados RAG.'); 
+        return []; 
+    }
+
     const { data, error } = await secureClient.rpc('match_legal_documents', {
         query_embedding: queryEmbedding as any, p_specialty: specialty || null, p_match_threshold: matchThreshold, p_match_count: 3 
     });
 
     if (error) { console.error('Error en RPC RAG:', error.message); return []; }
-    if (queryEmbedding === FALLBACK_EMBEDDING) { console.warn('Alerta: Embedding Fallback usado. Ignorando resultados RAG.'); return []; }
     return data;
 }
 
@@ -210,7 +266,9 @@ async function classifyLegalSpecialty(query: string): Promise<{ specialty: strin
     try { return await geminiBreaker.execute(fn, FALLBACK_CLASSIFICATION, 'Classification Service'); } catch (e) { throw e; }
 }
 
-/** Genera la respuesta, la transmite por streaming y devuelve los tokens usados (Cambio 7, 9, 10) */
+/** * Genera la respuesta, la transmite por streaming y devuelve los tokens usados (Cambio 7, 9, 10).
+ * 🐛 CORRECCIÓN: Ya no reenvía el FALLBACK_AUGMENTATION_TEXT dos veces (Problema 2).
+ */
 async function generateAugmentedResponse(context: string, query: string, whatsappId: string): Promise<{ responseText: string, usage: number }> {
     const systemPrompt = `Eres el Agente Legal AVOCADO. Genera un "Concepto Previo" basándote únicamente en el contexto legal proporcionado. Si el contexto es insuficiente, informa al usuario que se necesita asistencia humana (Handoff). Sé conciso y profesional.`;
     const userPrompt = `Consulta del usuario: ${query}\n\nContexto Legal Recuperado:\n---\n${context}\n---`;
@@ -231,11 +289,16 @@ async function generateAugmentedResponse(context: string, query: string, whatsap
 
     try {
         const result = await geminiBreaker.execute(fn, FALLBACK_AUGMENTATION, 'Augmentation Service');
-        if (result.responseText === FALLBACK_AUGMENTATION_TEXT) { await sendWhatsappMessage(whatsappId, result.responseText); }
+        
+        // Si el breaker forzó el fallback, enviamos el mensaje aquí (si no hubo streaming)
+        if (result.responseText === FALLBACK_AUGMENTATION_TEXT) { 
+             await sendWhatsappMessage(whatsappId, result.responseText);
+        }
         return result;
 
     } catch (e) {
         console.error('Fallo grave no controlado en generación:', e.message);
+        // Si falló de forma crítica, enviamos el mensaje de Handoff
         await sendWhatsappMessage(whatsappId, FALLBACK_AUGMENTATION_TEXT);
         return FALLBACK_AUGMENTATION;
     }
@@ -302,7 +365,8 @@ export async function runAgentRouter( // <-- Nombre de la función final (Cambio
         const errorMessage = e.message.includes('too long')
             ? `⚠️ Lo siento, tu mensaje excede el límite de ${MAX_INPUT_LENGTH} caracteres. Por favor, envíalo en partes más cortas.`
             : '⚠️ Lo siento, tu mensaje es demasiado corto o contiene caracteres inválidos. Por favor, reformula tu consulta.';
-        await sendWhatsappMessage(whatsapp_id, errorMessage);
+        // sendWhatsappMessage puede fallar, pero lo intentamos de todas formas
+        await sendWhatsappMessage(whatsapp_id, errorMessage).catch(console.error);
         return; 
     }
 

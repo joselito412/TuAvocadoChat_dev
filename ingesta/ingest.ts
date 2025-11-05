@@ -3,7 +3,7 @@
 // --- Usamos importaciones de paquetes Node.js locales ---
 import { createClient } from '@supabase/supabase-js'; 
 import { GoogleGenAI } from '@google/genai';         
-import { GoogleAuth } from 'google-auth-library'; // <-- Revertimos a usar GoogleAuth
+import { GoogleAuth } from 'google-auth-library';
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config'; 
@@ -12,7 +12,6 @@ import { fileURLToPath } from 'url';
 // --- CONFIGURACIÓN DE ENTORNO (CRÍTICA) ---
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!; 
-// Eliminamos GEMINI_API_KEY ya que no es compatible
 const EMBEDDING_MODEL = 'text-embedding-004'; 
 
 // CRÍTICO: IDs para la prueba (deben existir en sus respectivas tablas)
@@ -25,21 +24,50 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ----------------------------------------------------------------------
+// --- INTERFACES NECESARIAS (Simuladas o importadas de /interfaces) ---
+// ----------------------------------------------------------------------
 
-// [FUNCIÓN DE AUTENTICACIÓN] Obtiene el cliente OAuth2 usando ADC
+interface LegalDocument {
+    document_id: string;
+    title: string;
+    specialty: 'Derecho Penal' | 'Derecho Civil' | 'Derecho Laboral' | 'Sin Clasificar';
+    full_text: string;
+    tenant_id: string;
+    metadata: {
+        source_name: string;
+        publication_date: string;
+    };
+}
+
+interface LegalChunk {
+    document_id: string;
+    content_chunk: string;
+    specialty: string;
+    tenant_id: string;
+    embedding?: number[]; // Agregado para el objeto final de inserción
+    // La estructura de metadata debe coincidir con la Capa 3
+    metadata: {
+        source_file: string;
+        article_number?: string; 
+        chunk_index: number;
+        word_count: number;
+    };
+}
+
+// ----------------------------------------------------------------------
+// --- FUNCIONES DE AUTENTICACIÓN Y RUTA (Sin cambios) ---
+// ----------------------------------------------------------------------
+
 async function getGoogleAuthClient() {
-    // ID de la Service Account que ya tiene el rol 'Usuario de Vertex AI'
     const SERVICE_ACCOUNT_TO_IMPERSONATE = '688865581027-compute@developer.gserviceaccount.com';
 
     const auth = new GoogleAuth({
-        // Usamos el scope válido que autorizamos con gcloud
         scopes: ['https://www.googleapis.com/auth/cloud-platform'],
     });
     
-    // [CRÍTICO]: Suplantamos la identidad de la Service Account que tiene el permiso
     const authClient = await auth.getClient();
     
-    // Esto crea un cliente que usa tu token ADC, pero actúa con la identidad del Compute Engine
     const impersonatedClient = await auth.getClient({
         targetServiceAccount: SERVICE_ACCOUNT_TO_IMPERSONATE,
         client: authClient
@@ -48,31 +76,76 @@ async function getGoogleAuthClient() {
     return impersonatedClient;
 }
 
-// Declaramos el cliente Gemini aquí
 let geminiClient: GoogleGenAI; 
 
-// [RESOLUCIÓN DE RUTA] Definición de __dirname para Módulos ES
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ----------------------------------------------------------------------
+// --- 🆕 CHUNKING INTELIGENTE (Reemplazo de simpleChunker) ---
+// ----------------------------------------------------------------------
+const MAX_CHARS_PER_CHUNK = 1000;
+const MIN_CHARS_PER_CHUNK = 100;
 
-/** Simulación simple de Chunking: divide el texto por párrafos. */
-function simpleChunker(text: string, documentId: string, specialty: string, source: string) {
-    const paragraphs = text.split('\n\n').filter(p => p.trim().length > 0);
-    
-    return paragraphs.map((content, index) => ({
-        content: content.trim(),
-        document_id: documentId,
+
+function createChunk(doc: LegalDocument, content: string, index: number, articleNumber?: string): LegalChunk {
+    return {
+        document_id: doc.document_id,
+        content_chunk: content,
+        specialty: doc.specialty,
+        tenant_id: doc.tenant_id,
         metadata: {
-            specialty: specialty, 
-            source_file: source,
+            source_file: doc.metadata.source_name,
+            article_number: articleNumber,
+            word_count: content.split(/\s+/).length,
             chunk_index: index,
         },
-        tenant_id: TEST_TENANT_ID, 
-    }));
+    };
 }
 
-/** Vectoriza los fragmentos y los inserta en la Base de Datos. */
+/** * Divide el texto legal respetando la estructura de artículos. 
+ * Si un artículo es muy largo, lo subdivide por párrafos.
+ */
+function smartChunker(doc: LegalDocument): LegalChunk[] {
+    // Regex para detectar "Artículo X. [contenido]"
+    const articleRegex = /(Artículo\s+\d+\.\s+.*?)(?=Artículo\s+\d+\.|$)/gs;
+    const matches = [...doc.full_text.matchAll(articleRegex)];
+
+    const chunks: LegalChunk[] = [];
+    let chunkIndex = 0;
+
+    // Fallback si no se detectan artículos (ej. es una sentencia)
+    if (matches.length === 0) {
+        const paragraphs = doc.full_text.split('\n\n').filter(p => p.trim().length > MIN_CHARS_PER_CHUNK);
+        return paragraphs.map((p, i) => createChunk(doc, p, i));
+    }
+
+    for (const match of matches) {
+        const articleText = match[1].trim();
+        const articleNumberMatch = articleText.match(/Artículo\s+(\d+)\./);
+        const articleNumber = articleNumberMatch ? articleNumberMatch[1] : undefined;
+
+        if (articleText.length > MAX_CHARS_PER_CHUNK) {
+            // Subdivisión si el artículo es muy largo
+            const paragraphs = articleText.split('\n\n').filter(p => p.trim().length > MIN_CHARS_PER_CHUNK);
+            
+            paragraphs.forEach(paragraph => {
+                chunks.push(createChunk(doc, paragraph, chunkIndex++, articleNumber));
+            });
+        } else if (articleText.length > MIN_CHARS_PER_CHUNK) {
+            // Chunk válido (Artículo completo)
+            chunks.push(createChunk(doc, articleText, chunkIndex++, articleNumber));
+        }
+    }
+
+    return chunks;
+}
+
+
+// ----------------------------------------------------------------------
+// --- FUNCIÓN PRINCIPAL DE INGESTA (Modificada) ---
+// ----------------------------------------------------------------------
+
 async function ingestDocument() {
     console.log("🚀 Iniciando Pipeline de Ingesta (Capa 0)...");
 
@@ -94,10 +167,24 @@ async function ingestDocument() {
 
     console.log(`[Paso 1] Documento cargado: ${fileName}. Longitud: ${fullText.length}`);
 
-    // 2. Chunking y Metadatos
-    const chunksToProcess = simpleChunker(fullText, TEST_DOCUMENT_ID, 'Derecho Civil', fileName);
+    // --- Definición del Documento Fuente (Datos Mock) ---
+    const sourceDocument: LegalDocument = {
+        document_id: TEST_DOCUMENT_ID,
+        title: fileName,
+        specialty: 'Derecho Civil', // Coincide con el ejemplo de sample_document.txt
+        full_text: fullText,
+        tenant_id: TEST_TENANT_ID,
+        metadata: {
+            source_name: fileName,
+            publication_date: new Date().toISOString().split('T')[0] 
+        }
+    };
 
-    const finalChunks = [];
+    // 2. Chunking y Metadatos
+    // 🆕 USO DE CHUNKING INTELIGENTE
+    const chunksToProcess = smartChunker(sourceDocument);
+
+    const finalChunks: LegalChunk[] = [];
     
     // 3. Vectorización de cada fragmento
     for (const chunk of chunksToProcess) {
@@ -105,7 +192,8 @@ async function ingestDocument() {
 
         const embeddingResponse = await geminiClient.models.embedContent({
             model: EMBEDDING_MODEL,
-            contents: [chunk.content], 
+            contents: [chunk.content_chunk], // Usar content_chunk
+            taskType: "RETRIEVAL_DOCUMENT" // Usar DOCUMENT para el corpus
         });
 
         if (!embeddingResponse.embeddings || embeddingResponse.embeddings.length === 0) {
@@ -113,18 +201,19 @@ async function ingestDocument() {
             continue; 
         }
 
-        // Uso de 'embeddings' (plural), tomamos el primer elemento [0] y la propiedad 'values' (plural).
         finalChunks.push({
             ...chunk,
+            // Uso de 'values' para el array de embedding
             embedding: embeddingResponse.embeddings[0].values, 
         });
     }
 
     // 4. Indexación Final (Escritura en C3)
-    console.log(`[Paso 4] Insertando ${finalChunks.length} fragmentos en legal_document_chunks...`);
+    // 🚨 USO DE NOMBRE DE TABLA CORREGIDO: legal_documents
+    console.log(`[Paso 4] Insertando ${finalChunks.length} fragmentos en legal_documents...`);
 
     const { error } = await supabase
-        .from('legal_document_chunks')
+        .from('legal_documents')
         .insert(finalChunks as any[]); 
 
     if (error) {
