@@ -1,0 +1,12 @@
+{
+  "type": "service_account",
+  "project_id": "avocadowhatsappapi",
+  "private_key_id": "A_LONG_UNIQUE_ID",
+  "private_key": "-----BEGIN PRIVATE KEY-----\n...SU CLAVE PRIVADA BASE64...\n-----END PRIVATE KEY-----\n",
+  "client_email": "rag-ingestor@avocadowhatsappapi.iam.gserviceaccount.com",
+  "client_id": "12345678901234567890",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "...",
+  "client_x509_cert_url": "..."
+}

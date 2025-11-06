@@ -1,7 +1,7 @@
 // ingest/ingest.ts
 
 // --- Usamos importaciones de paquetes Node.js locales ---
-import { createClient } from '@supabase/supabase-js'; 
+import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI } from '@google/genai';         
 import { GoogleAuth } from 'google-auth-library';
 import * as fs from 'fs';
@@ -15,8 +15,11 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const EMBEDDING_MODEL = 'text-embedding-004'; 
 
 // CRÍTICO: IDs para la prueba (deben existir en sus respectivas tablas)
-const TEST_TENANT_ID = "00000000-0000-0000-0000-000000000001"; 
+const TEST_TENANT_ID = "57d5a03b-80e0-4ed4-b230-103b786af8a4"; // UUID del Tenant REAL
 const TEST_DOCUMENT_ID = "11111111-1111-1111-1111-111111111111"; 
+
+// 🆕 CRÍTICO: ARCHIVO DE CLAVE DE CUENTA DE SERVICIO
+const KEY_FILE_NAME = 'rag-key.json'; 
 
 // Cliente Supabase (Con rol de servicio para bypass RLS)
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -25,7 +28,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ----------------------------------------------------------------------
-// --- INTERFACES NECESARIAS (Simuladas o importadas de /interfaces) ---
+// --- INTERFACES NECESARIAS (Sin cambios) ---
 // ----------------------------------------------------------------------
 
 interface LegalDocument {
@@ -45,8 +48,7 @@ interface LegalChunk {
     content_chunk: string;
     specialty: string;
     tenant_id: string;
-    embedding?: number[]; // Agregado para el objeto final de inserción
-    // La estructura de metadata debe coincidir con la Capa 3
+    embedding?: number[]; 
     metadata: {
         source_file: string;
         article_number?: string; 
@@ -56,33 +58,40 @@ interface LegalChunk {
 }
 
 // ----------------------------------------------------------------------
-// --- FUNCIONES DE AUTENTICACIÓN Y RUTA (Sin cambios) ---
+// --- FUNCIONES DE AUTENTICACIÓN (MÉTODO KEYFILE SEGURO) ---
 // ----------------------------------------------------------------------
-
-async function getGoogleAuthClient() {
-    const SERVICE_ACCOUNT_TO_IMPERSONATE = '688865581027-compute@developer.gserviceaccount.com';
-
-    const auth = new GoogleAuth({
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-    });
-    
-    const authClient = await auth.getClient();
-    
-    const impersonatedClient = await auth.getClient({
-        targetServiceAccount: SERVICE_ACCOUNT_TO_IMPERSONATE,
-        client: authClient
-    });
-
-    return impersonatedClient;
-}
-
-let geminiClient: GoogleGenAI; 
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const KEY_FILE_PATH = path.join(__dirname, KEY_FILE_NAME);
+
+/**
+ * 🆕 Inicializa el cliente Gemini usando un archivo de Clave JSON.
+ * Este método bypassa el fallo de negociación de scope de ADC/Suplantación.
+ */
+async function initializeGeminiClient() {
+    if (!fs.existsSync(KEY_FILE_PATH)) {
+        throw new Error(`ERROR: No se encontró el archivo de clave JSON en: ${KEY_FILE_PATH}. Por favor, cree y descargue una Service Account Key.`);
+    }
+
+    const auth = new GoogleAuth({
+        keyFile: KEY_FILE_PATH,
+        // Usar scopes amplios para cubrir Vertex AI y Generative Language
+        scopes: [
+            'https://www.googleapis.com/auth/cloud-platform',
+            'https://www.googleapis.com/auth/generative-language'
+        ],
+    });
+
+    return await auth.getClient();
+}
 
 // ----------------------------------------------------------------------
-// --- 🆕 CHUNKING INTELIGENTE (Reemplazo de simpleChunker) ---
+
+let geminiClient: GoogleGenAI; 
+
+// ----------------------------------------------------------------------
+// --- 🆕 CHUNKING INTELIGENTE (Sin cambios) ---
 // ----------------------------------------------------------------------
 const MAX_CHARS_PER_CHUNK = 1000;
 const MIN_CHARS_PER_CHUNK = 100;
@@ -149,8 +158,8 @@ function smartChunker(doc: LegalDocument): LegalChunk[] {
 async function ingestDocument() {
     console.log("🚀 Iniciando Pipeline de Ingesta (Capa 0)...");
 
-    // [INICIALIZACIÓN CRÍTICA] Autenticación con ADC/OAuth2
-    const authClient = await getGoogleAuthClient();
+    // [INICIALIZACIÓN CRÍTICA] 🆕 Usa el nuevo método de autenticación
+    const authClient = await initializeGeminiClient();
     geminiClient = new GoogleGenAI({ 
         auth: authClient 
     });

@@ -1,7 +1,8 @@
 // supabase/functions/whatsapp-webhook/index.ts
 
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.0';
+import { serve } from 'https://deno.land/std@0.208.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.44.2';
+
 // Importamos el agente simulado (LangGraph Mock) de la Capa 4/5
 import { runAgentRouter } from './agent_manager.ts';
 
@@ -56,18 +57,20 @@ function generateRandomCode(): string {
  * @param client El cliente Supabase que puede ser anon o serviceRoleClient.
  * @returns El objeto de perfil completo, incluyendo el jwt_token.
  */
+
 async function authenticateAndGetUserProfile(whatsappId: string, client: any): Promise<any> {
     
-    const { data, error } = await client.rpc('upsert_user_free', {
-        p_whatsapp_id: whatsappId, 
-        p_full_name: null, 
-        p_email: null, 
+    // CRÍTICO: El nombre de la RPC y el único argumento deben coincidir con el SQL
+    const { data, error } = await client.rpc('upsert_user_and_get_jwt', {
+        whatsapp_user_id_in: whatsappId // El SQL solo espera este argumento
     }).single(); 
 
     if (error) {
-        throw new Error(`RPC Auth Error (upsert_user_free): ${error.message}`);
+        // El error anterior era: RPC Auth Error (upsert_user_free)
+        throw new Error(`RPC Auth Error (upsert_user_and_get_jwt): ${error.message}`);
     }
     
+    // La RPC retorna { jwt_token, user_id }, lo cual es perfecto para el resto del flujo.
     return data;
 }
 

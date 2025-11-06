@@ -1,8 +1,21 @@
 {
+  // CRÍTICO: Indica a la extensión dónde encontrar el ejecutable de Deno.
+  // Debe reemplazar la ruta de ejemplo con la que obtenga al ejecutar 'which deno'
+  "deno.path": "/Users/su_usuario/.deno/bin/deno", 
+
+  // 1. Deno Enable Paths: Limita Deno a la carpeta de funciones Edge (Capa 2)
   "deno.enablePaths": [
-    "supabase/functions"
+    "./supabase/functions"
   ],
+  
+  // 2. Import Map: CRÍTICO para la Capa 4. Resuelve los alias de 'supabase/' y '@google/genai' 
+  // que usa su código para LangGraph y RAG.
+  "deno.importMap": "./supabase/functions/deno.json", 
+
   "deno.lint": true,
+  
+  // 3. Unstable Features: Obligatorio para usar módulos de Node.js (LangGraph) 
+  // y para ciertas APIs necesarias en el Edge Runtime.
   "deno.unstable": [
     "bare-node-builtins",
     "byonm",
@@ -18,6 +31,7 @@
     "http",
     "net"
   ],
+  
   "[typescript]": {
     "editor.defaultFormatter": "denoland.vscode-deno"
   }
